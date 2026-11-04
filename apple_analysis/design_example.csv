@@ -1,0 +1,7 @@
+run,device,condition,sensor_type,start_utc,neighbour_utc,end_utc
+1,biolingo-demo-A1,dummy,biolingo,2026-11-10T14:00:00Z,2026-11-12T14:00:00Z,2026-11-14T14:00:00Z
+1,biolingo-demo-A2,control,biolingo,2026-11-10T14:00:00Z,2026-11-12T14:00:00Z,2026-11-14T14:00:00Z
+1,biolingo-demo-B3,test,breadboard,2026-11-10T14:00:00Z,2026-11-12T14:00:00Z,2026-11-14T14:00:00Z
+2,biolingo-demo-A2,dummy,biolingo,2026-11-15T14:00:00Z,2026-11-17T14:00:00Z,2026-11-19T14:00:00Z
+2,biolingo-demo-B3,control,breadboard,2026-11-15T14:00:00Z,2026-11-17T14:00:00Z,2026-11-19T14:00:00Z
+2,biolingo-demo-A1,test,biolingo,2026-11-15T14:00:00Z,2026-11-17T14:00:00Z,2026-11-19T14:00:00Z
