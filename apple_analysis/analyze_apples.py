@@ -26,8 +26,8 @@ What this script does
      bin, because neighbouring bins are strongly autocorrelated.
   7. Robustness checks and exploratory band (2-5 Hz), plus a regression with
      sensor type as a control variable (Peter's advice).
-  8. An exploratory sweep over other frequency bands (0.5-45 Hz, and 55-95 Hz for
-     400 Hz data), corrected for looking at many bands at once (Holm).
+  8. An exploratory sweep over other frequency bands (slow bands 0.01-0.5 Hz, then 0.5-45 Hz,
+     and 55-95 Hz for 400 Hz data), corrected for looking at many bands at once (Holm).
 
 The PRIMARY measure and test are fixed below. Decide them BEFORE recording
 and do not change them after looking at data. Everything else is exploratory.
@@ -39,7 +39,8 @@ Input
             Bins within --exclude-events-min of an event are dropped.
 
 Output (in --out)
-  windows.csv, runs_summary.csv, sweep.csv, report.txt, run_<id>.png, summary.png, sweep.png
+  windows.csv, runs_summary.csv, sweep.csv, dropped.csv, report.txt, run_<id>.png,
+  spectrogram_run_<id>.png, summary.png, sweep.png
 """
 import argparse
 import re
@@ -53,12 +54,20 @@ from scipy import signal, stats
 from scipy.ndimage import uniform_filter1d
 
 # ----- PRIMARY measure and test: fix before recording ----------------------
-PRIMARY_BAND = (5.0, 20.0)   # Hz, band from Peter's pilot
+PRIMARY_BAND = (5.0, 20.0)   # Hz, band from Peter's pilot. Peter says band choice is trial and error:
+                             # pick it from the test run / pilot files, then LOCK it (fill in the next line).
+PRIMARY_LOCKED_ON = "not locked yet"   # e.g. "2026-12-03, chosen from test-run files, before real runs"
 EXTRA_BAND = (2.0, 5.0)      # Hz, exploratory (best band in the pilot)
 ALPHA = 0.05
 # Exploratory frequency sweep (Peter's pilot bands, then 55-95 Hz for 400 Hz data).
 # The 50 Hz mains line and its harmonics are cut out of every band (see MAINS_EXCL_HZ).
-SWEEP_BANDS = [(0.5, 1.0), (1.0, 2.0), (2.0, 5.0), (5.0, 10.0), (10.0, 20.0), (20.0, 45.0), (55.0, 95.0)]
+# Slow bands (Peter: "slow bands are sometimes more interesting"; he mentioned one change every ~44 s = 0.023 Hz).
+# Anything with its upper edge at or below SLOW_MAX_HZ goes through the slow path (long Welch segments, no
+# high-pass), see bin_features(). 0.01-0.03 Hz is a 33-100 s rhythm and contains 0.023 Hz.
+SLOW_MAX_HZ = 0.5
+SLOW_BANDS = [(0.01, 0.03), (0.03, 0.1), (0.1, 0.5)]
+FAST_BANDS = [(0.5, 1.0), (1.0, 2.0), (2.0, 5.0), (5.0, 10.0), (10.0, 20.0), (20.0, 45.0), (55.0, 95.0)]
+SWEEP_BANDS = SLOW_BANDS + FAST_BANDS
 MAINS_EXCL_HZ = 1.5          # drop +/- this many Hz around 50, 100, 150 ... Hz
 # ---------------------------------------------------------------------------
 
@@ -72,6 +81,10 @@ def band_name(b):
 
 
 ALL_BANDS = list(dict.fromkeys([PRIMARY_BAND, EXTRA_BAND] + SWEEP_BANDS))
+
+
+def is_slow(b):
+    return b[1] <= SLOW_MAX_HZ
 
 
 # ------------------------------------------------------------------ reading
@@ -120,6 +133,7 @@ def bin_features(t0, arr, fs, a):
     idx = np.arange(len(arr))
     x = np.interp(idx, idx[obs], arr[obs]) / 10.0          # mV
     x = x - x.mean()
+    x_slow = x.copy()                                       # slow path: no filtering at all (see below)
     if a.box_notch and fs >= 200 and round(fs) % 50 == 0:   # optional: moving average over one 50 Hz period
         x = uniform_filter1d(x, int(round(fs / 50)), mode="nearest")
     if a.highpass > 0:
@@ -134,22 +148,45 @@ def bin_features(t0, arr, fs, a):
         near_mains |= np.abs(f - 50.0 * k) <= MAINS_EXCL_HZ
     for b in ALL_BANDS:
         lo, hi = b
+        if is_slow(b):
+            continue                                        # handled by the slow path below
         if hi <= fs / 2:
             m = (f >= lo) & (f <= hi) & ~near_mains
             if m.sum() >= 2:
                 out["p_" + band_name(b)] = float(p[m].sum() * df)   # mV^2
+    # slow bands: one long Welch segment length (default 150 s -> 3 half-overlapping segments in a 5-min bin,
+    # frequency steps of ~0.007 Hz), linear detrend instead of a high-pass. A high-pass at 0.5 Hz would delete
+    # these bands, and a filter near 0.01 Hz would ring at the edges of a 5-minute bin.
+    if any(is_slow(b) for b in ALL_BANDS):
+        nslow = int(round(a.slow_segment_s * fs))
+        if nslow <= len(x_slow):
+            fs_, ps = signal.welch(x_slow, fs=fs, window="hann", nperseg=nslow,
+                                   noverlap=nslow // 2, detrend="linear")
+            dfs = float(fs_[1] - fs_[0])
+            for b in ALL_BANDS:
+                if is_slow(b):
+                    m = (fs_ >= b[0]) & (fs_ <= b[1])
+                    if m.sum() >= 2:
+                        out["p_" + band_name(b)] = float(ps[m].sum() * dfs)
     out["std_mv"] = float(x.std())
+    out["_psd"] = p.astype(np.float32)      # kept for the spectrograms
+    out["_f"] = f.astype(np.float32)
     return out
 
 
 def load_device(files, a):
     """All 5-minute bins of one device, aligned to a common epoch grid."""
-    rows, buf = [], {}
+    rows, buf, spectra, hold = [], {}, {}, {}
     L = lambda fs: int(round(a.bin_seconds * fs))
 
     def finalize(b):
         arr, fs = buf.pop(b)
-        rows.append(bin_features(b * a.bin_seconds, arr, fs, a))
+        row = bin_features(b * a.bin_seconds, arr, fs, a)
+        psd, fr = row.pop("_psd", None), row.pop("_f", None)
+        if psd is not None:
+            spectra[row["t_epoch"]] = psd
+            hold.setdefault("f", fr)
+        rows.append(row)
 
     for epoch, path in files:
         fs, x = read_wav(path)
@@ -175,7 +212,7 @@ def load_device(files, a):
             i = j
     for b in sorted(buf):
         finalize(b)
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows), spectra, hold.get("f")
 
 
 # ------------------------------------------------------------------- design
@@ -270,6 +307,61 @@ def ols(X, y, names):
     return pd.DataFrame({"coef": beta, "se": se, "t": t, "p": p}, index=names).assign(df=n - k)
 
 
+# ------------------------------------------------------------- spectrograms
+def plot_spectrogram(run, drows, spectra, freqs, a, out, plt):
+    """Every frequency over time, one panel per channel. White = dropped or missing."""
+    order = {"dummy": 0, "control": 1, "test": 2}
+    drows = sorted(drows, key=lambda r: order.get(r["condition"], 9))
+    mats = []
+    for r in drows:
+        dev = r["device"]
+        f, sp = freqs.get(dev), spectra.get(dev, {})
+        if f is None or not sp:
+            mats.append(None)
+            continue
+        idx0 = int(np.floor(r["start"] / a.bin_seconds))
+        n = int(np.floor((r["end"] - 1) / a.bin_seconds)) - idx0 + 1
+        keep = f >= 0.5
+        fk = f[keep]
+        M = np.full((len(fk), n), np.nan)
+        for t0, psd in sp.items():
+            j = int(round(t0 / a.bin_seconds)) - idx0
+            if 0 <= j < n:
+                M[:, j] = 10 * np.log10(np.maximum(psd[keep], 1e-12))
+        near = np.zeros(len(fk), bool)                 # hide the mains lines
+        for k in range(1, int(fk[-1] // 50) + 1):
+            near |= np.abs(fk - 50.0 * k) <= MAINS_EXCL_HZ
+        M[near, :] = np.nan
+        mats.append((M, fk, idx0, n))
+    good = [m[0][np.isfinite(m[0])] for m in mats if m is not None]
+    vals = np.concatenate(good) if good else np.array([])
+    if vals.size == 0:
+        return
+    vmin, vmax = np.percentile(vals, [2, 98])
+    fig, axes = plt.subplots(len(drows), 1, figsize=(10, 2.7 * len(drows)), sharex=True, squeeze=False)
+    im = None
+    for ax, m, r in zip(axes[:, 0], mats, drows):
+        ax.set_title(f"{r['condition']} ({r['device']})", fontsize=9, loc="left")
+        if m is None:
+            ax.text(0.5, 0.5, "no data", ha="center", va="center", transform=ax.transAxes)
+            continue
+        M, fk, idx0, n = m
+        xe = ((np.arange(n + 1) + idx0) * a.bin_seconds - r["start"]) / 3600
+        d = fk[1] - fk[0]
+        ye = np.append(fk - d / 2, fk[-1] + d / 2)
+        im = ax.pcolormesh(xe, ye, M, vmin=vmin, vmax=vmax, cmap="viridis")
+        ax.set_yscale("log")
+        ax.set_ylim(0.5, min(fk[-1], 100))
+        ax.set_ylabel("Hz")
+        ax.axvline((r["nb"] - r["start"]) / 3600, color="white", ls="--", lw=1)
+    axes[-1, 0].set_xlabel("hours since start (dashed line = neighbour added)")
+    fig.suptitle(f"Run {run}: every frequency over time (white = dropped or missing)", fontsize=10)
+    if im is not None:
+        fig.colorbar(im, ax=axes[:, 0].tolist(), label="power (dB)", pad=0.01)
+    fig.savefig(out / f"spectrogram_run_{run}.png", dpi=130, bbox_inches="tight")
+    plt.close(fig)
+
+
 # ---------------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -279,7 +371,11 @@ def main():
     ap.add_argument("--events", default=None)
     ap.add_argument("--bin-seconds", type=int, default=300)
     ap.add_argument("--segment-s", type=float, default=4.0, help="Welch segment length (s)")
-    ap.add_argument("--highpass", type=float, default=0.5, help="high-pass Hz, 0 = off")
+    ap.add_argument("--highpass", type=float, default=0.5,
+                    help="high-pass Hz for the bands from 0.5 Hz up, 0 = off (slow bands are never high-passed)")
+    ap.add_argument("--slow-segment-s", type=float, default=150.0,
+                    help="Welch segment length (s) for the slow bands below 0.5 Hz; must be at most half the bin "
+                         "so that at least 3 segments average. Lowest usable frequency is about 2 / this value.")
     ap.add_argument("--box-notch", dest="box_notch", action="store_true",
                     help="also smooth 400 Hz data with a moving average over one 50 Hz period (old behaviour). "
                          "Off by default: the mains line is cut out in the frequency domain instead.")
@@ -289,6 +385,9 @@ def main():
     ap.add_argument("--exclude-event-hours", type=float, default=1.0, help="around the neighbour being added")
     ap.add_argument("--exclude-events-min", type=float, default=15.0, help="around logged touches")
     a = ap.parse_args()
+    if a.slow_segment_s > a.bin_seconds / 2:
+        print(f"WARNING: --slow-segment-s {a.slow_segment_s:g} is more than half of --bin-seconds {a.bin_seconds}: "
+              "slow-band estimates will average fewer than 3 segments and be very noisy.", file=sys.stderr)
 
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -300,13 +399,13 @@ def main():
         events = list(to_epoch(ev["time"]))
 
     # 1. features per device
-    cache = {}
+    cache, spectra, freqs = {}, {}, {}
     for dev in sorted(design["device"].unique()):
         if dev not in files:
             print(f"WARNING: no files found for device '{dev}'", file=sys.stderr)
             continue
         print(f"reading {dev}: {len(files[dev])} files")
-        cache[dev] = load_device(files[dev], a)
+        cache[dev], spectra[dev], freqs[dev] = load_device(files[dev], a)
 
     # 2. windows table per run
     parts = []
@@ -349,6 +448,26 @@ def main():
         W["y_" + key] = W["y_" + band_name(b)]
     W.to_csv(out / "windows.csv", index=False)
 
+    # data used and dropped, per run and channel
+    drop_rows = []
+    for _, r in design.iterrows():
+        g = W[(W.run == r["run"]) & (W.device == r["device"])]
+        ok = g[g.flag == "ok"]
+        exp = int((r["end"] - r["start"]) // a.bin_seconds)
+        drop_rows.append({
+            "run": r["run"], "channel": r["condition"], "device": r["device"],
+            "expected_bins": exp, "never_recorded": max(exp - len(g), 0),
+            "dropped_gaps": int((g.flag == "coverage").sum()),
+            "dropped_saturated": int((g.flag == "saturated").sum()),
+            "left_out_by_design": int((ok.phase == "excluded").sum()),
+            "used_before": int((ok.phase == "before").sum()),
+            "used_after": int((ok.phase == "after").sum())})
+    D = pd.DataFrame(drop_rows)
+    exp_ = D.expected_bins.replace(0, np.nan)
+    D["share_clean"] = ((D.expected_bins - D.never_recorded - D.dropped_gaps - D.dropped_saturated) / exp_).round(2)
+    D["share_used"] = ((D.used_before + D.used_after) / exp_).round(2)
+    D.to_csv(out / "dropped.csv", index=False)
+
     # 4. per run summary
     rows = []
     for run, g in W.groupby("run", sort=True):
@@ -384,15 +503,25 @@ def main():
     P = lines.append
     P("COINs Team 2 apple experiment: analysis report")
     P("=" * 60)
-    P(f"Runs analysed: {len(S)}   bin = {a.bin_seconds}s   Welch segment = {a.segment_s}s   high-pass = {a.highpass} Hz")
-    P(f"Bins kept per channel are listed in runs_summary.csv. Dropped bins: "
-      f"{int((W.flag != 'ok').sum())} of {len(W)} (gaps or saturation).")
+    P(f"Runs analysed: {len(S)}   bin = {a.bin_seconds}s   Welch segment = {a.segment_s}s   high-pass = {a.highpass} Hz"
+      f"   slow-band segment = {a.slow_segment_s:g}s")
+    P("")
+    P("DATA USED AND DROPPED (5-minute bins, per run and channel; also in dropped.csv)")
+    P("  never_recorded = no file covered the bin; dropped_gaps = more than "
+      f"{(1 - a.min_coverage) * 100:g}% of samples missing; dropped_saturated = more than "
+      f"{a.max_sat * 100:g}% of readings at the rails;")
+    P("  left_out_by_design = skipped on purpose (settling time, around the neighbour being added, near logged touches).")
+    P(D.to_string(index=False))
+    P("  share_clean = recorded and passed the quality checks; share_used = actually used in the statistics.")
+    P("  A channel with a share_clean under about 0.9 deserves a look before you trust its numbers.")
     P("")
     P("All effects are on log10 band power, apple minus dummy. A value of 0.30 means "
       "about 2x the power; -0.30 about half.")
     P("")
     prim = run_level(S["did_main"])
-    P(f"PRIMARY (confirmatory): band {PRIMARY_BAND[0]:g}-{PRIMARY_BAND[1]:g} Hz")
+    P(f"PRIMARY (confirmatory): band {PRIMARY_BAND[0]:g}-{PRIMARY_BAND[1]:g} Hz   [locked: {PRIMARY_LOCKED_ON}]")
+    if PRIMARY_LOCKED_ON == "not locked yet":
+        P("  WARNING: the primary band is not locked. A band picked after seeing the real runs makes this p-value meaningless.")
     P("  effect of a rotten neighbour = change(test) - change(control), per run")
     for _, r in S.iterrows():
         P(f"  run {r['run']}:  control {r['control_delta_main']:+.3f}   test {r['test_delta_main']:+.3f}"
@@ -445,6 +574,9 @@ def main():
                 ci_hi=SW.ci_hi.round(3), p=SW.p.round(3), p_holm=SW.p_holm.round(3))
       .to_string(index=False))
     P("  Bands above 45 Hz exist only for 400 Hz data. Treat anything here as 'interesting, needs follow-up'.")
+    P("  Bands below 0.5 Hz (slow bands) use long segments and no high-pass. Check two things before believing them: (1) the")
+    P("  dummy channel (it should show no change there), (2) temperature and humidity, which drift slowly too and are the")
+    P("  most likely false explanation for a slow-band change. Also check that the board itself passes these frequencies.")
     P("")
     # sensor type as a control variable
     recs = []
@@ -497,6 +629,9 @@ def main():
         fig.tight_layout()
         fig.savefig(out / f"run_{run}.png", dpi=130)
         plt.close(fig)
+    for run in sorted(design["run"].unique()):
+        plot_spectrogram(run, [r for _, r in design[design.run == run].iterrows()],
+                         spectra, freqs, a, out, plt)
     fig, ax = plt.subplots(figsize=(9, 4))
     ok = SW[SW["runs"] > 0]
     xpos = np.arange(len(ok))
