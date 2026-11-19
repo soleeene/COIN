@@ -28,6 +28,14 @@ ap.add_argument("--seed", type=int, default=1)
 ap.add_argument("--effect", type=float, default=1.5, help="amplitude factor in the test channel after the neighbour is added (1.0 = no effect)")
 ap.add_argument("--effect-band", type=float, nargs=2, metavar=("LO", "HI"), default=None,
                 help="put the effect ONLY in this band (Hz) instead of all frequencies")
+ap.add_argument("--sites", nargs="+", default=["single"], help="site names, used in turn for the runs, e.g. switzerland germany")
+ap.add_argument("--jump-channel", choices=["dummy", "control", "test"], default=None,
+                help="make a sudden lasting level jump on this channel (like the one in Peter's pilot)")
+ap.add_argument("--jump-hour", type=float, default=30.0, help="hours after the start of each run")
+ap.add_argument("--jump-factor", type=float, default=0.33, help="amplitude factor from then on (0.33 = signal drops to a third)")
+ap.add_argument("--warm-test", type=float, default=0.0, help="the test bag gets this many degrees warmer after the neighbour is added")
+ap.add_argument("--temp-coupling", type=float, default=0.0,
+                help="apple signal amplitude changes by this fraction per degree (a climate confound to test the control variables)")
 a = ap.parse_args()
 rng = np.random.default_rng(a.seed)
 
@@ -38,6 +46,9 @@ sensor = {"biolingo-demo-A1": "biolingo", "biolingo-demo-A2": "biolingo", "bioli
 gain = {"biolingo": 1.0, "breadboard": 1.3}             # different sensors read differently
 conds = ["dummy", "control", "test"]
 rows = []
+climate = []
+events = []
+weights = []
 
 
 def write_chunk(dev, epoch, mv):
@@ -54,11 +65,30 @@ for r in range(a.runs):
     start = BASE + r * 86400
     nb = start + a.hours * 3600
     end = nb + a.hours * 3600
+    site = a.sites[r % len(a.sites)]
+    events.append((datetime.fromtimestamp(start + 5 * 3600, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "bag opened to check the apple"))
+    for h in range(int((end - start) // 3600) + 1):      # room logger, hourly
+        tt = start + h * 3600
+        climate.append((datetime.fromtimestamp(tt, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "room",
+                        round(19 + 1.5 * np.sin(2 * np.pi * (tt % 86400) / 86400) + rng.normal(0, .1), 2),
+                        round(45 + rng.normal(0, 1), 1)))
     for k, dev in enumerate(devices):
         cond = conds[(k - r) % 3]                       # rotate sensors across conditions
         rows.append((r + 1, dev, cond, sensor[dev],
                      datetime.fromtimestamp(start, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                     datetime.fromtimestamp(nb, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")))
+                     datetime.fromtimestamp(nb, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), site))
+        def temp_at(tt, cond=cond):
+            return 20 + 1.5 * np.sin(2 * np.pi * (tt % 86400) / 86400) + (a.warm_test if (cond == "test" and tt >= nb) else 0.0)
+        for h in range(int((end - start) // 3600) + 1):  # one logger per bag, hourly
+            tt = start + h * 3600
+            climate.append((datetime.fromtimestamp(tt, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), dev,
+                            round(temp_at(tt) + rng.normal(0, .1), 2), round(60 + (5 if cond != "dummy" else 0) + rng.normal(0, 1), 1)))
+        if cond != "dummy":
+            weights += [(r + 1, f"{cond}_apple", 190.0, round(190 - rng.uniform(2, 4), 1))]
+        if cond == "test":
+            weights += [(r + 1, "rotten_neighbour", 175.0, round(175 - rng.uniform(8, 14), 1))]
+        if cond == "control":
+            weights += [(r + 1, "healthy_neighbour", 185.0, round(185 - rng.uniform(2, 4), 1))]
         t = start
         n_chunk = int((end - start) // 300)
         for c in range(n_chunk):
@@ -72,6 +102,10 @@ for r in range(a.runs):
                 else:
                     sigma *= a.effect
             sigma *= gain[sensor[dev]]
+            if a.jump_channel == cond and t >= start + a.jump_hour * 3600:
+                sigma *= a.jump_factor
+            if cond != "dummy" and a.temp_coupling:
+                sigma *= 1 + a.temp_coupling * (temp_at(t + 150) - 20)
             n = 300 * a.fs
             mv = 1650 + rng.normal(0, sigma, n) + 3 * np.sin(2 * np.pi * np.arange(n) / (a.fs * 600))
             if extra_s > 0:                                # extra power only inside the chosen band
@@ -90,6 +124,12 @@ for r in range(a.runs):
 import csv
 with open(out / "design.csv", "w", newline="") as f:
     w = csv.writer(f)
-    w.writerow(["run", "device", "condition", "sensor_type", "start_utc", "neighbour_utc"])
+    w.writerow(["run", "device", "condition", "sensor_type", "start_utc", "neighbour_utc", "site"])
     w.writerows(rows)
-print(f"wrote demo data to {out}/ and {out}/design.csv")
+with open(out / "climate.csv", "w", newline="") as f:
+    w = csv.writer(f); w.writerow(["time", "sensor", "temp_c", "humidity"]); w.writerows(climate)
+with open(out / "events.csv", "w", newline="") as f:
+    w = csv.writer(f); w.writerow(["time", "note"]); w.writerows(events)
+with open(out / "weights.csv", "w", newline="") as f:
+    w = csv.writer(f); w.writerow(["run", "role", "weight_start_g", "weight_end_g"]); w.writerows(weights)
+print(f"wrote demo data to {out}/ and {out}/design.csv, climate.csv, events.csv, weights.csv")
