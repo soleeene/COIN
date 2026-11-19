@@ -6,8 +6,10 @@ compared with adding a healthy apple? Three channels run in parallel (dummy, con
 
 ## Files
 - `analyze_apples.py`: the analysis.
-- `make_demo_data.py`: makes fake data in the server's format, to try the analysis first.
-- `design_example.csv`: template for the design file (example values only).
+- `make_demo_data.py`: makes fake data in the server's format, to try the analysis first. It can also add a sudden jump on one channel, a warmer test bag, several sites, and writes example climate, event and weight files.
+- `pilot_compare.py`: compares several sensors band by band (used on Peter's pilot recordings, which have no before/after).
+- `power_sim.py`: how many runs do we need? Smallest effect the main test can find with 2 to 8 runs.
+- Templates (example values only): `design_example.csv`, `events_example.csv`, `climate_example.csv`, `weights_example.csv`.
 
 ## Set up
 ```
@@ -31,14 +33,23 @@ The report should show a difference near +0.35. Use `--effect 1.0` for no effect
    - `sensor_type` is `biolingo` or `breadboard`
    - times are UTC. Cologne winter time is UTC+1, so 15:00 in Cologne is `14:00:00Z`.
      `end_utc` is optional (default: as long after as before).
-3. Optional: `events.csv` with a column `time` (UTC) listing every bag opening or touch.
+3. Optional files (each one adds a section to the report; see the `*_example.csv` templates):
+   - `events.csv`: columns `time` (UTC) and `note`, every bag opening or touch. Bins near an event are left out,
+     and the notes explain jumps in the signal.
+   - `climate.csv`: columns `time` (UTC), `sensor`, `temp_c`, `humidity`. `sensor` is the logger of a bag (column
+     `logger` in the design file, default = the device name) or `room`. Hourly is enough. Used as control variables.
+   - `weights.csv`: columns `run`, `role`, `weight_start_g`, `weight_end_g`: weight loss per apple.
+   - In the design file, an optional `site` column (for example `germany`, `switzerland`) shows results per site and
+     controls for the site.
 4. Run:
 ```
-python analyze_apples.py --data path/to/data --design design.csv --events events.csv --out results
+python analyze_apples.py --data path/to/data --design design.csv --events events.csv --climate climate.csv --weights weights.csv --out results
 ```
 
 ## What you get
-- `report.txt`: the primary test, robustness checks, the exploratory band, the frequency sweep and the sensor-type regression
+- `report.txt`: the primary test (with automatic warnings), robustness checks, the exploratory band, the frequency sweep,
+  sudden jumps, results per site, temperature and humidity, weight loss and the regression (sensor type, site, climate)
+- `jumps.csv`: every sudden level change in the primary band, whether the dummy saw it too and whether an event explains it
 - `sweep.csv` and `sweep.png`: the exploratory frequency sweep (below)
 - `dropped.csv` (and a section in `report.txt`): for every run and channel, how many 5-minute bins were expected,
   never recorded, dropped for gaps, dropped for saturation, left out on purpose, and actually used
@@ -71,6 +82,17 @@ python analyze_apples.py --data path/to/data --design design.csv --events events
 - **Locking the primary band:** Peter calls band choice trial and error. Pick it from the test-run or pilot
   files, change `PRIMARY_BAND`, then write the date into `PRIMARY_LOCKED_ON` at the top of the script.
   The report prints a warning until this is filled in.
+- **Sudden jumps.** In Peter's pilot, one sensor dropped to about 0.6x in 5-20 Hz at one moment while the other two
+  stayed put. Subtracting the dummy only removes jumps that hit every channel. The report lists every lasting jump
+  (at least 1.4x within an hour), says whether it was on one channel only and whether an event in the log explains it,
+  and warns under the main result when a one-channel jump has no explanation. The robustness section also
+  shows the result using medians, which jumps disturb less.
+- **Temperature and humidity.** If the test and control bags changed differently (more than 1 degree or 10% humidity),
+  the report warns: the signal may follow the climate, and with so few runs the regression cannot separate the two.
+  The cleanest fix is to keep both bags in the same conditions, and to log the climate in every bag.
+- **How many runs?** Run `python power_sim.py` (add `--pilot pilot_windows.csv` for a first guess from Peter's pilot).
+  With only 2 runs the t-test has 1 degree of freedom and finds almost nothing; 3 or more is much better. Replace
+  the guess with the real run-to-run variation after the first runs.
 - **Mains hum:** the 50 Hz line and its harmonics (50, 100, 150 Hz, plus or minus 1.5 Hz) are cut out of every
   band in the frequency domain. The old option of also smoothing 400 Hz data with a moving average is off by
   default; turn it on with `--box-notch`.
