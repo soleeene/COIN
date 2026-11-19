@@ -35,11 +35,16 @@ and do not change them after looking at data. Everything else is exploratory.
 Input
   --data    folder with the server's files (<device>/<device>_<UTC>_<epoch>.wav)
   --design  CSV, one row per run x device (see design_example.csv)
-  --events  optional CSV with a column "time" (UTC): bag openings, touches.
+  --events  optional CSV with a column "time" (UTC) and optionally "note": bag openings, touches.
             Bins within --exclude-events-min of an event are dropped.
+  --climate optional CSV with columns time (UTC), sensor, temp_c, humidity. "sensor" is the logger id of a bag
+            (column "logger" in the design file, default = the device name) or "room". Used as control variables.
+  --weights optional CSV (run, role, weight_start_g, weight_end_g): weight loss per apple goes into the report.
+  The design file may also have a "site" column (e.g. switzerland / germany): results are then shown per site and
+  site is a control variable.
 
 Output (in --out)
-  windows.csv, runs_summary.csv, sweep.csv, dropped.csv, report.txt, run_<id>.png,
+  windows.csv, runs_summary.csv, sweep.csv, dropped.csv, jumps.csv, report.txt, run_<id>.png,
   spectrogram_run_<id>.png, summary.png, sweep.png
 """
 import argparse
@@ -231,6 +236,12 @@ def read_design(path):
     bad = set(d["condition"]) - {"dummy", "control", "test"}
     if bad:
         sys.exit(f"condition must be dummy, control or test; got {sorted(bad)}")
+    if "site" not in d.columns:
+        d["site"] = "single"
+    d["site"] = d["site"].fillna("single").astype(str).str.strip().str.lower()
+    if "logger" not in d.columns:
+        d["logger"] = d["device"]
+    d["logger"] = d["logger"].fillna(d["device"])
     d["start"] = to_epoch(d["start_utc"])
     d["nb"] = to_epoch(d["neighbour_utc"])
     if "end_utc" in d.columns and d["end_utc"].notna().any():
@@ -267,16 +278,85 @@ def phase_stats(g, col):
     b = g.loc[g.phase == "before", col].dropna()
     af = g.loc[g.phase == "after", col].dropna()
     r = {"n_before": len(b), "n_after": len(af), "delta": np.nan,
-         "delta_wins": np.nan, "delta_h1": np.nan, "delta_h2": np.nan}
+         "delta_wins": np.nan, "delta_h1": np.nan, "delta_h2": np.nan, "delta_med": np.nan}
     if len(b) < 12 or len(af) < 12:      # need at least an hour of bins on each side
         return r
     r["delta"] = af.mean() - b.mean()
+    r["delta_med"] = af.median() - b.median()
     lo, hi = pd.concat([b, af]).quantile([0.01, 0.99])
     r["delta_wins"] = af.clip(lo, hi).mean() - b.clip(lo, hi).mean()
     half = len(af) // 2
     r["delta_h1"] = af.iloc[:half].mean() - b.mean()
     r["delta_h2"] = af.iloc[half:].mean() - b.mean()
     return r
+
+
+def phase_mean_delta(g, col):
+    """Mean(after) - mean(before) of a column (used for temperature and humidity)."""
+    if col not in g.columns:
+        return np.nan
+    b = g.loc[g.phase == "before", col].mean()
+    af = g.loc[g.phase == "after", col].mean()
+    return float(af - b) if np.isfinite(b) and np.isfinite(af) else np.nan
+
+
+def detect_jumps(x, win=12, min_log=0.15, k=5.0, min_sep=12, burst_bins=36):
+    """Sudden, lasting level shifts in a log10 band-power series on a regular grid (NaN = missing).
+    step[i] = median of the next `win` bins minus median of the previous `win` bins (win=12 -> 1 hour).
+    A jump is a step larger than max(min_log, k * robust sigma of all steps); neighbours closer than
+    `min_sep` bins keep only the biggest. A jump that is undone by an opposite jump of at least 70% of its size within
+    `burst_bins` (3 hours) is a short burst, not a lasting change. Returns a list of (index, step, kind),
+    kind = "jump" or "burst"."""
+    x = np.asarray(x, float)
+    n = len(x)
+    step = np.full(n, np.nan)
+    for i in range(win, n - win + 1):
+        a, b = x[i - win:i], x[i:i + win]
+        if np.isfinite(a).sum() >= win // 2 and np.isfinite(b).sum() >= win // 2:
+            step[i] = np.nanmedian(b) - np.nanmedian(a)
+    fin = step[np.isfinite(step)]
+    if len(fin) < 10:
+        return []
+    sigma = 1.4826 * np.median(np.abs(fin - np.median(fin)))
+    thr = max(min_log, k * sigma)
+    cand = [i for i in np.where(np.abs(np.nan_to_num(step)) > thr)[0]]
+    cand.sort(key=lambda i: -abs(step[i]))
+    keep = []
+    for i in cand:
+        if all(abs(i - j) >= min_sep for j in keep):
+            keep.append(i)
+    keep = sorted(keep)
+    out = []
+    for i in keep:
+        undone = any(0 < j - i <= burst_bins or 0 < i - j <= burst_bins
+                     for j in keep if np.sign(step[j]) == -np.sign(step[i]) and abs(step[j]) >= 0.7 * abs(step[i]))
+        out.append((i, float(step[i]), "burst" if undone else "jump"))
+    return out
+
+
+def read_climate(path):
+    c = pd.read_csv(path)
+    c = c.rename(columns={"humidity": "rh_pct", "rh": "rh_pct", "temp": "temp_c", "temperature": "temp_c"})
+    need = {"time", "sensor", "temp_c", "rh_pct"}
+    if need - set(c.columns):
+        sys.exit(f"climate file needs columns time, sensor, temp_c, humidity; missing {sorted(need - set(c.columns))}")
+    c["t_epoch"] = to_epoch(c["time"])
+    c["sensor"] = c["sensor"].astype(str).str.strip()
+    return c.sort_values("t_epoch")
+
+
+def climate_on_grid(clim, sensor, t_centers, col, max_gap_s=7200):
+    """Linear interpolation of a logger series onto the 5-minute bin centres. NaN if the nearest reading is too far."""
+    c = clim[clim.sensor == sensor].dropna(subset=[col])
+    out = np.full(len(t_centers), np.nan)
+    if len(c) < 2:
+        return out
+    t, v = c["t_epoch"].to_numpy(), c[col].to_numpy(float)
+    out = np.interp(t_centers, t, v)
+    nearest = np.min(np.abs(t_centers[:, None] - t[None, :]), axis=1) if len(t) < 400 else \
+        np.abs(t_centers - t[np.clip(np.searchsorted(t, t_centers), 1, len(t) - 1)])
+    out[nearest > max_gap_s] = np.nan
+    return out
 
 
 def holm(pvals):
@@ -379,6 +459,8 @@ def main():
     ap.add_argument("--box-notch", dest="box_notch", action="store_true",
                     help="also smooth 400 Hz data with a moving average over one 50 Hz period (old behaviour). "
                          "Off by default: the mains line is cut out in the frequency domain instead.")
+    ap.add_argument("--climate", default=None, help="CSV: time, sensor, temp_c, humidity (control variables)")
+    ap.add_argument("--weights", default=None, help="CSV: run, role, weight_start_g, weight_end_g")
     ap.add_argument("--min-coverage", type=float, default=0.95)
     ap.add_argument("--max-sat", type=float, default=0.01, help="drop bins with more saturated samples")
     ap.add_argument("--skip-start-hours", type=float, default=2.0, help="settling time after start")
@@ -393,10 +475,12 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     design = read_design(a.design)
     files = find_files(a.data)
-    events = []
+    events, event_notes = [], []
     if a.events:
         ev = pd.read_csv(a.events)
         events = list(to_epoch(ev["time"]))
+        event_notes = list(ev["note"].fillna("")) if "note" in ev.columns else [""] * len(events)
+    clim = read_climate(a.climate) if a.climate else None
 
     # 1. features per device
     cache, spectra, freqs = {}, {}, {}
@@ -415,7 +499,12 @@ def main():
         f = cache[r["device"]]
         f = f[(f.t_epoch >= r["start"]) & (f.t_epoch + a.bin_seconds <= r["end"])].copy()
         f["run"], f["device"] = r["run"], r["device"]
-        f["condition"], f["sensor_type"] = r["condition"], r["sensor_type"]
+        f["condition"], f["sensor_type"], f["site"] = r["condition"], r["sensor_type"], r["site"]
+        if clim is not None:
+            tc = f["t_epoch"].to_numpy() + a.bin_seconds / 2
+            f["temp_c"] = climate_on_grid(clim, r["logger"], tc, "temp_c")
+            f["rh_pct"] = climate_on_grid(clim, r["logger"], tc, "rh_pct")
+            f["room_temp_c"] = climate_on_grid(clim, "room", tc, "temp_c")
         f["hours"] = (f.t_epoch - r["start"]) / 3600
         ex = a.exclude_event_hours * 3600
         t_end = f.t_epoch + a.bin_seconds
@@ -471,11 +560,13 @@ def main():
     # 4. per run summary
     rows = []
     for run, g in W.groupby("run", sort=True):
-        rec = {"run": run}
+        rec = {"run": run, "site": g["site"].iloc[0]}
         for cond in ("control", "test"):
             gc = g[g.condition == cond]
             rec[cond + "_device"] = gc["device"].iloc[0] if len(gc) else ""
             rec[cond + "_sensor"] = gc["sensor_type"].iloc[0] if len(gc) else ""
+            rec[cond + "_dtemp"] = phase_mean_delta(gc, "temp_c")
+            rec[cond + "_drh"] = phase_mean_delta(gc, "rh_pct")
         for band in ("main", "extra"):
             res = {}
             for cond in ("control", "test"):
@@ -486,7 +577,7 @@ def main():
                 rec[f"{cond}_raw_delta_{band}"] = phase_stats(gc, "log_" + band)["delta"]
             gd = g[g.condition == "dummy"].sort_values("t_epoch")
             rec[f"dummy_delta_{band}"] = phase_stats(gd, "log_" + band)["delta"]
-            for k in ("delta", "delta_wins", "delta_h1", "delta_h2"):
+            for k in ("delta", "delta_wins", "delta_h1", "delta_h2", "delta_med"):
                 rec[f"did_{k}_{band}" if k != "delta" else f"did_{band}"] = res["test"][k] - res["control"][k]
             rec[f"did_raw_{band}"] = rec[f"test_raw_delta_{band}"] - rec[f"control_raw_delta_{band}"]
         for b in SWEEP_BANDS:
@@ -497,6 +588,41 @@ def main():
         rows.append(rec)
     S = pd.DataFrame(rows)
     S.to_csv(out / "runs_summary.csv", index=False)
+
+    # sudden level jumps (primary band, raw log power per channel), checked against the dummy and the event log
+    jrows = []
+    for _, r in design.iterrows():
+        g = W[(W.run == r["run"]) & (W.device == r["device"])]
+        if g.empty or g["log_main"].notna().sum() < 30:
+            continue
+        i0, i1 = int(g.t_epoch.min() // a.bin_seconds), int(g.t_epoch.max() // a.bin_seconds)
+        grid = np.full(i1 - i0 + 1, np.nan)
+        grid[(g.t_epoch // a.bin_seconds).astype(int) - i0] = g["log_main"].where(g.flag == "ok")
+        for i, st, kind in detect_jumps(grid):
+            jrows.append({"run": r["run"], "channel": r["condition"], "device": r["device"], "kind": kind,
+                          "t_epoch": (i0 + i) * a.bin_seconds, "hours": (i0 + i) * a.bin_seconds / 3600 - r["start"] / 3600,
+                          "step_log10": st, "ratio": 10 ** st, "start": r["start"], "nb": r["nb"]})
+    J = pd.DataFrame(jrows)
+    if len(J):
+        ex_s = a.exclude_event_hours * 3600
+        def why(row):
+            if abs(row.t_epoch - row.nb) <= ex_s + a.bin_seconds:
+                return "at the neighbour being added"
+            for e, nt in zip(events, event_notes):
+                if abs(row.t_epoch - e) <= 30 * 60 + a.bin_seconds:
+                    return "near a logged event" + (f" ({nt})" if nt else "")
+            return "UNEXPLAINED"
+        J["explained_by"] = J.apply(why, axis=1)
+        def shared(row):
+            if row.channel == "dummy":
+                return ""
+            o = J[(J.run == row.run) & (J.channel != row.channel) & (abs(J.t_epoch - row.t_epoch) <= 30 * 60)
+                  & (np.sign(J.step_log10) == np.sign(row.step_log10))]
+            return "also on " + "/".join(sorted(o.channel)) if len(o) else "this channel only"
+        J["seen_elsewhere"] = J.apply(shared, axis=1)
+        J["time_utc"] = pd.to_datetime(J.t_epoch, unit="s", utc=True).dt.strftime("%Y-%m-%d %H:%M")
+        J = J[["run", "channel", "device", "kind", "time_utc", "hours", "step_log10", "ratio", "explained_by", "seen_elsewhere"]]
+    J.to_csv(out / "jumps.csv", index=False)
 
     # 5. report
     lines = []
@@ -534,6 +660,24 @@ def main():
         P(f"  Result: {verdict} at alpha {ALPHA}.")
     else:
         P("  Not enough runs for a test (need at least 2).")
+    # automatic warnings: things that can fake or hide an effect
+    warn = []
+    if len(J):
+        bad = J[(J.kind == "jump") & (J.explained_by == "UNEXPLAINED") & (J.channel != "dummy") & (J.seen_elsewhere == "this channel only")]
+        if len(bad):
+            warn.append(f"{len(bad)} sudden jump(s) on a single apple channel with no matching event (runs {sorted(set(bad.run))}). "
+                        "A jump like this can fake or hide an effect: see SUDDEN LEVEL JUMPS below.")
+    if clim is not None:
+        dT = (S["test_dtemp"] - S["control_dtemp"]).abs()
+        dH = (S["test_drh"] - S["control_drh"]).abs()
+        if (dT > 1.0).any() or (dH > 10.0).any():
+            warn.append("temperature or humidity changed very differently in the test and control bags "
+                        f"(largest gap {np.nanmax(dT):.1f} C, {np.nanmax(dH):.0f}% humidity). The signal may follow the climate, "
+                        "and the regression cannot separate the two when only one bag changed.")
+    if S["site"].nunique() > 1 and S.groupby("site").size().min() < 2:
+        warn.append("one site has only one run: site and run cannot be separated.")
+    for w_ in warn:
+        P("  WARNING: " + w_)
     P(f"  Note: with n = {prim['n']} runs this test has little power and the t-test relies on "
       "normality. Report the per-run values and the effect size, not only p.")
     P("")
@@ -541,6 +685,7 @@ def main():
     for label, col in (("with extreme values clipped (1st-99th pct)", "did_delta_wins_main"),
                        ("first half of the after phase only", "did_delta_h1_main"),
                        ("second half of the after phase only", "did_delta_h2_main"),
+                       ("using medians instead of means (less sensitive to jumps)", "did_delta_med_main"),
                        ("WITHOUT subtracting the dummy", "did_raw_main")):
         s = run_level(S[col])
         P(f"  {label}: mean {s['mean']:+.3f}, runs with positive sign "
@@ -578,13 +723,63 @@ def main():
     P("  dummy channel (it should show no change there), (2) temperature and humidity, which drift slowly too and are the")
     P("  most likely false explanation for a slow-band change. Also check that the board itself passes these frequencies.")
     P("")
+    # sudden jumps
+    P("SUDDEN LEVEL JUMPS (primary band; a change of at least 0.15 in log10, about 1.4x, within one hour; a burst is undone within 3 hours)")
+    if len(J):
+        P(J.assign(hours=J.hours.round(1), step_log10=J.step_log10.round(2), ratio=J.ratio.round(2)).to_string(index=False))
+        P("  A jump on every channel at once (\"also on ...\") is removed by subtracting the dummy. A jump on ONE channel is not,")
+        P("  and if nothing in the event log explains it, it can fake or hide an effect. Look at jumps.csv and the run plots,")
+        P("  and compare with the 'medians' line in the robustness section.")
+    else:
+        P("  none found")
+    P("")
+    # site
+    if S["site"].nunique() > 1:
+        P("RESULTS PER SITE (primary band, test minus control change per run)")
+        for site, gs in S.groupby("site"):
+            rs = run_level(gs["did_main"])
+            P(f"  {site}: runs {rs['n']}   mean difference {rs['mean']:+.3f}"
+              + (f"   per run: {', '.join(f'{v:+.3f}' for v in gs['did_main'].dropna())}" if rs["n"] else ""))
+        P("  Different places have different air, light and temperature; site is also a control variable below.")
+        P("")
+    # climate
+    if clim is not None:
+        P("TEMPERATURE AND HUMIDITY (control variables)")
+        P("  change after - before in each apple's bag (per run), and the difference test - control:")
+        for _, r in S.iterrows():
+            dt = r["test_dtemp"] - r["control_dtemp"]
+            dh = r["test_drh"] - r["control_drh"]
+            P(f"  run {r['run']}:  temperature control {r['control_dtemp']:+.2f} C, test {r['test_dtemp']:+.2f} C (diff {dt:+.2f});"
+              f"   humidity control {r['control_drh']:+.1f}%, test {r['test_drh']:+.1f}% (diff {dh:+.1f})")
+        P("  If the two bags changed differently, that alone can explain a difference in the signal.")
+        P("  Rank correlation between the apple signal (apple minus dummy, primary band) and its bag climate, over the bins used:")
+        for (run, cond), gg in W[(W.condition != "dummy") & W.phase.isin(["before", "after"])].groupby(["run", "condition"]):
+            parts_ = []
+            for col, lab in (("temp_c", "temperature"), ("rh_pct", "humidity")):
+                d_ = gg[["y_main", col]].dropna()
+                if len(d_) >= 30 and d_[col].nunique() > 3:
+                    rho, pv = stats.spearmanr(d_["y_main"], d_[col])
+                    parts_.append(f"{lab} rho {rho:+.2f}")
+            P(f"    run {run} {cond}: " + (", ".join(parts_) if parts_ else "not enough climate data"))
+        P("  Strong correlations (more than about 0.5) mean the signal moves with the climate: treat the result with care.")
+        P("")
+    # weights
+    if a.weights:
+        wt = pd.read_csv(a.weights)
+        wt["loss_pct"] = ((wt["weight_start_g"] - wt["weight_end_g"]) / wt["weight_start_g"] * 100).round(1)
+        P("APPLE WEIGHT LOSS (start to end)")
+        P(wt.to_string(index=False))
+        P("  A rotten apple loses weight faster; very different losses between the two healthy apples are worth a note.")
+        P("")
     # sensor type as a control variable
     recs = []
     for _, r in S.iterrows():
         for cond in ("control", "test"):
-            recs.append({"run": r["run"], "is_test": int(cond == "test"),
-                         "sensor": r[cond + "_sensor"], "delta": r[cond + "_delta_main"]})
-    R = pd.DataFrame(recs).dropna()
+            recs.append({"run": r["run"], "is_test": int(cond == "test"), "site": r["site"],
+                         "sensor": r[cond + "_sensor"], "delta": r[cond + "_delta_main"],
+                         "dtemp": r[cond + "_dtemp"], "drh": r[cond + "_drh"]})
+    R_all = pd.DataFrame(recs)
+    R = R_all.dropna(subset=["delta", "sensor"])
     P("SENSOR TYPE AS A CONTROL VARIABLE (apple channels, change in log10 power)")
     if len(R) and R["sensor"].nunique() > 0:
         types = sorted(R["sensor"].unique())
@@ -600,6 +795,25 @@ def main():
               "conditions, 'test vs control' is the effect after allowing for sensor type.")
     else:
         P("  not available")
+    # extended model: also site and climate changes, when they exist and vary
+    ext = R_all.dropna(subset=["delta", "sensor"]).copy()
+    terms, tnames = [np.ones(len(ext)), ext["is_test"].to_numpy(float)], ["intercept", "test vs control"]
+    for t in sorted(ext["sensor"].unique())[1:]:
+        terms.append((ext["sensor"] == t).astype(float).to_numpy()); tnames.append(f"sensor {t}")
+    sites_ = sorted(ext["site"].unique())
+    for t in sites_[1:]:
+        terms.append((ext["site"] == t).astype(float).to_numpy()); tnames.append(f"site {t} vs {sites_[0]}")
+    for col, lab in (("dtemp", "temperature change"), ("drh", "humidity change")):
+        if ext[col].notna().all() and ext[col].nunique() > 1:
+            terms.append(ext[col].to_numpy(float)); tnames.append(lab)
+    if len(tnames) > 3 + 0 and (len(sites_) > 1 or "temperature change" in tnames or "humidity change" in tnames):
+        P("")
+        P("EXTENDED MODEL: sensor type, site and climate change together (apple channels, change in log10 power)")
+        fit2 = ols(np.column_stack(terms), ext["delta"].to_numpy(), tnames)
+        if fit2 is None:
+            P(f"  Too few data points ({len(ext)}) for {len(tnames)} terms. Every extra control variable needs more runs.")
+        else:
+            P(fit2.round(3).to_string())
     (out / "report.txt").write_text("\n".join(lines), encoding="utf-8")
     print("\n".join(lines))
 
